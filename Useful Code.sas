@@ -1,5 +1,28 @@
 *Indy macros;
+%include "S:\IndyHealth_Library\include_sas_macros_redirect.sas" / source2;
+options compress = yes mprint noquotelenmax;
+option spool = yes;
+
 options sasautos = ("S:\MISC\_IndyMacros\Code\General Routines" sasautos) compress = yes;
+
+/*CopyRoboCopy (IndyMacro) to bring datasets to local workspace*/
+%CopyRoboCopy(
+    sourcedir       = %sysfunc(pathname(elig))
+    ,destinationdir = %sysfunc(pathname(work))
+    ,file           = elgblty_2020*
+    ,sas_options    = noxwait xsync
+    ,options        = /r:20
+    ,quote_filearg  = No
+);
+
+
+/*Delete datasets*/
+proc datasets noprint library = work;
+  delete capitation_&yearmo.;
+  delete Exposure_&yearmo.;
+  quit;
+run;
+
 
 /*Create format statement with drugs found*/
 data NDC_fmt(keep = Start Label FmtName Type HLo);
@@ -96,6 +119,10 @@ data mmd.past12mo;
 *Compress function lets us combine numeric and character values in one field - WITHOUT WARNING MESSAGE;
 	quarter = compress(fy||calc_qtr);
 
+*Coalesce function allows you to populate a field with more than one field, determined by order of fields - if null, move to next field;
+	Service_Category = coalescec(EUM_DRG, EUM_PROC, EUM_REV);
+	*Numeric fields use coalesce, while character fields use coalesceC;
+	Number_Fill = coalesce(1,2,3);
 
 *Substring the first 3 characters of a field;
 	REVENUE_CODE_3 = substr(REVENUE_CODE,1,3);
@@ -140,6 +167,28 @@ data all_certified_cap;
 	fy = 20&NxNxYr.;
 	
 	%date_loop(01OCT20&NxYr.,01SEP20&NxNxYr.)
+run;
+
+
+*When stacking multiple datasets, keep track of the names of each;
+data DeltaDental_ExpandArea;
+    set ENCData.Enc_Delexpandarea20:
+    		ENCData.Delexpandarea20:
+    		ENCData.Encexpandarea20:
+        indsname=source /* INDSNAME= option keeps track of name of source data set */
+    ;
+  dsname = scan(source,2,'.'); /* extract the dataset name */
+  format entry_date $8.;
+  entry_date = substr(dsname,length(dsname)-7,8);
+run;
+*Variant: Assign Incurred_Month field with date format;
+data _elgblty_cy20;
+	set elgblty_2020:
+  	INDSNAME=Source;
+
+	dataset=scan(source,2,'.');
+  format Incurred_Month mmddyy10.;
+  Incurred_Month = mdy(substr(dataset,length(dataset)-1,2),1,substr(dataset,length(dataset)-5,4));
 run;
 
 
@@ -252,6 +301,21 @@ data proj.fy&NxYr._mhsa_nodup;
 run;
 
 
+*Select all of the fields that have all null values into the &eqd_nulls. macro variable;
+ods select none;
+ods output nlevels=temp;
+proc freq data = eqd_claims nlevels;
+    tables _all_;
+run;
+ods select all;
+proc sql noprint;
+	select tablevar into : eqd_nulls separated by ' '
+		from temp
+		where NNonMissLevels=0;
+	%put &eqd_nulls;
+quit;
+
+
 
 *Calculate fields from a dataset using proc sql, then storing it in a macro variable;
 proc sql noprint;
@@ -288,6 +352,25 @@ data dabtanf_r_cap;
 		if test(i) = . then test(i) = 0;
 	end;
 run;
+
+
+*When writing an inline dataset, it is possible to use macro variables inside of the values;
+*Example below tells SAS to evaluate the macro variables and save as new fields;
+data example (keep = meta_field meta_field_label);
+	length meta_field_stage meta_field_label_stage meta_field meta_field_label $40.;
+	input meta_field_stage $ meta_field_label_stage $;
+	infile datalines dsd delimiter = ',';
+	meta_field=dequote(resolve(quote(meta_field_stage)));
+	meta_field_label=dequote(resolve(quote(meta_field_label_stage)));
+	datalines;
+&meta_field_1, &meta_field_label_1
+&meta_field_2, &meta_field_label_2
+&meta_field_3, &meta_field_label_3
+&meta_field_4, &meta_field_label_4
+&meta_field_5, &meta_field_label_5
+;
+run;
+
 
 
 *proc import to import a named range from Excel - note labels are specified NONE (remove DBSASLABEL to include labels);
@@ -352,11 +435,34 @@ run;
 %Export(mhsa_enc_monthly_detail, Encounters)
 
 
+*Passing macro variables with commas as parameters into a macro function;
+%let Class_Vars_Comma = 'Population,Rate_Cell,Health_Plan';
+%map_exposures(sc,%bquote(&Class_Vars_Comma));
+
+%macro map_exposures(desc,vars);
+data outset;
+	set inset;
+
+	format Exposure_Units best12.;
+	if _N_ eq 1 then do;
+	  call Missing(Exposure_Units);
+	  declare hash eqd_ht(dataset:"EQD_Exposure_summary");
+		eqd_ht.definekey('Data_Source',%unquote(&vars));	/*unquote function tells SAS to unquote special characters*/
+	  eqd_ht.definedata("Exposure_Units");
+	  eqd_ht.definedone();
+	end;
+	matches = eqd_ht.find();
+	drop matches;
+run;
+%mend map_exposures;
+
+
+
 %AssertDataSetNotPopulated(unmatched_negatives,ReturnMessage=There are unmatched negative payments);
 %AssertNoDuplicates(DataSetName,IDVars,ReturnMessage=Assertion failure in current program,FailAction=);
 
 
-*Create one record per month based on the given start & end dates;
+*Create one record per month based on the given start & end dates (DHIP-specific);
 data dhip_months;
 	set dhip_eligibility;
 	by BenID;
@@ -387,6 +493,35 @@ data dhip_months;
 	do while (startmonth GT dhip_start);
 		endmonth = startmonth - 1;
 		startmonth = max(intnx('month',endmonth,0,'begin'),dhip_start);
+		output;
+	end;
+
+	drop global_end;
+run;
+
+*Create one record per month based on the given start & end dates (Generalized);
+data patient_share_hcbs;
+	set _stg_patient_share_hcbs;
+	by MemberID;
+
+	*assign the global end dates for our time-window eligibility file;
+	format global_end MMDDYY10.;
+	global_end = "31DEC2021"d;
+
+	*Now make the small windows;
+	format pat_start pat_end startmonth endmonth MMDDYY10.;
+
+	pat_start = from_date;
+	pat_end = min(to_date,global_end);
+
+	endmonth = min(intnx('month',pat_end,0,'end'),global_end);
+	startmonth = intnx('month',endmonth,0,'begin');
+	output;
+
+	*Create one record per member month;
+	do while (startmonth GT pat_start);
+		endmonth = startmonth - 1;
+		startmonth = max(intnx('month',endmonth,0,'begin'),pat_start);
 		output;
 	end;
 
@@ -425,7 +560,11 @@ proc transpose data=dd_diag_benids out=dd_diag_benids_2(drop=_: rename = (col1=v
   var col:;
 run;
 
+
+
 /***** SAS SPECIFIC FOOTER SECTION *****/
+%put System Return Code = &syscc.;
+
 %LogAuditing();
 /*There must be a SAS Logs/Error_Check subfolder 
 in the same folder as the executing program (which must be saved)
